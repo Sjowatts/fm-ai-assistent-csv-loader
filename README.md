@@ -1,6 +1,6 @@
 # fm-ai-assistent-csv-loader
 
-Load Football Manager view exports into [fm-ai-assistent](https://github.com/JelmerBouma1985/fm-ai-assistent), so the app can be driven from FM view exports instead of by reading Football Manager's memory.
+Load Football Manager view exports into [fm-ai-assistent](https://github.com/JelmerBouma1985/fm-ai-assistent), so it runs without reading FM's memory — which means it runs on macOS.
 
 ## Why
 
