@@ -1,0 +1,1964 @@
+diff --git a/src/main/java/com/github/fmaiassistent/config/FmAiAssistentMcpConfiguration.java b/src/main/java/com/github/fmaiassistent/config/FmAiAssistentMcpConfiguration.java
+index 589e5c3..b7f5d7d 100644
+--- a/src/main/java/com/github/fmaiassistent/config/FmAiAssistentMcpConfiguration.java
++++ b/src/main/java/com/github/fmaiassistent/config/FmAiAssistentMcpConfiguration.java
+@@ -1,6 +1,7 @@
+ package com.github.fmaiassistent.config;
+ 
+ import com.github.fmaiassistent.mcp.FmAiAssistentTools;
++import com.github.fmaiassistent.mcp.FmCsvTools;
+ import com.github.fmaiassistent.mcp.FmDecisionTools;
+ import com.github.fmaiassistent.mcp.FmSnapshotTools;
+ import org.springframework.ai.tool.ToolCallbackProvider;
+@@ -15,9 +16,10 @@ class FmAiAssistentMcpConfiguration {
+     ToolCallbackProvider fmAiAssistentToolCallbackProvider(
+             FmAiAssistentTools tools,
+             FmSnapshotTools snapshotTools,
+-            FmDecisionTools decisionTools) {
++            FmDecisionTools decisionTools,
++            FmCsvTools csvTools) {
+         return MethodToolCallbackProvider.builder()
+-                .toolObjects(tools, snapshotTools, decisionTools)
++                .toolObjects(tools, snapshotTools, decisionTools, csvTools)
+                 .build();
+     }
+ }
+diff --git a/src/main/java/com/github/fmaiassistent/csv/CsvColumnMapping.java b/src/main/java/com/github/fmaiassistent/csv/CsvColumnMapping.java
+new file mode 100644
+index 0000000..8717a97
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/csv/CsvColumnMapping.java
+@@ -0,0 +1,280 @@
++package com.github.fmaiassistent.csv;
++
++import com.github.fmaiassistent.player.AttributeDefinitions;
++import com.github.fmaiassistent.player.FieldDef;
++import com.github.fmaiassistent.staff.StaffAttributeDefinitions;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Optional;
++import java.util.stream.Stream;
++
++/**
++ * Resolves the headers of an exported FM view against the field names the snapshot
++ * writer expects. Both FM's abbreviated column captions ("Cmp", "OtB") and its full
++ * attribute names are accepted.
++ */
++public final class CsvColumnMapping {
++    private static final Map<String, String> IDENTITY_ALIASES = identityAliases();
++    private static final Map<String, String> ATTRIBUTE_ALIASES = attributeAliases();
++    private static final Map<String, String> STAFF_IDENTITY_ALIASES = staffIdentityAliases();
++    private static final Map<String, String> STAFF_ATTRIBUTE_ALIASES = staffAttributeAliases();
++
++    private final Map<String, String> headersByTarget;
++    private final Map<String, String> attributeFieldsByHeader;
++    private final List<String> unmappedHeaders;
++
++    private CsvColumnMapping(
++            Map<String, String> headersByTarget,
++            Map<String, String> attributeFieldsByHeader,
++            List<String> unmappedHeaders) {
++        this.headersByTarget = Map.copyOf(headersByTarget);
++        this.attributeFieldsByHeader = Map.copyOf(attributeFieldsByHeader);
++        this.unmappedHeaders = List.copyOf(unmappedHeaders);
++    }
++
++    public static CsvColumnMapping of(CsvTable table) {
++        return of(table, Kind.PLAYER);
++    }
++
++    public static CsvColumnMapping of(CsvTable table, Kind kind) {
++        Map<String, String> identityAliases = kind == Kind.STAFF ? STAFF_IDENTITY_ALIASES : IDENTITY_ALIASES;
++        Map<String, String> attributeAliases = kind == Kind.STAFF ? STAFF_ATTRIBUTE_ALIASES : ATTRIBUTE_ALIASES;
++        Map<String, String> headersByTarget = new LinkedHashMap<>();
++        Map<String, String> attributeFieldsByHeader = new LinkedHashMap<>();
++        List<String> unmapped = new ArrayList<>();
++        for (String header : table.headers()) {
++            String key = normalize(header);
++            if (key.isEmpty()) {
++                continue;
++            }
++            if ("nat".equals(key) && kind == Kind.PLAYER) {
++                if (readsAsRating(table, header)) {
++                    attributeFieldsByHeader.put(header, "NaturalFitness");
++                } else {
++                    headersByTarget.putIfAbsent("nationality", header);
++                }
++                continue;
++            }
++            String attribute = attributeAliases.get(key);
++            if (attribute != null) {
++                attributeFieldsByHeader.put(header, attribute);
++                continue;
++            }
++            String target = identityAliases.get(key);
++            if (target != null) {
++                headersByTarget.putIfAbsent(target, header);
++                continue;
++            }
++            unmapped.add(header);
++        }
++        if (!headersByTarget.containsKey("name")) {
++            throw new IllegalArgumentException("The CSV has no "
++                    + (kind == Kind.STAFF ? "staff" : "player")
++                    + " name column. Add Name to the FM view before exporting.");
++        }
++        return new CsvColumnMapping(headersByTarget, attributeFieldsByHeader, unmapped);
++    }
++
++    public Optional<String> header(String target) {
++        return Optional.ofNullable(headersByTarget.get(target));
++    }
++
++    public boolean has(String target) {
++        return headersByTarget.containsKey(target);
++    }
++
++    public Map<String, String> attributeFieldsByHeader() {
++        return attributeFieldsByHeader;
++    }
++
++    public List<String> unmappedHeaders() {
++        return unmappedHeaders;
++    }
++
++    public List<String> mappedTargets() {
++        return List.copyOf(headersByTarget.keySet());
++    }
++
++    /**
++     * FM abbreviates both Nationality and Natural Fitness as "Nat". A column whose values
++     * all read as 1-20 ratings is the attribute; anything else is the nation.
++     */
++    private static boolean readsAsRating(CsvTable table, String header) {
++        int sampled = 0;
++        for (Map<String, String> row : table.rows()) {
++            String value = row.get(header);
++            if (CsvValues.isUnknown(value)) {
++                continue;
++            }
++            if (CsvValues.attribute(value).isEmpty() || !value.trim().chars().allMatch(
++                    ch -> Character.isDigit(ch) || ch == '-' || ch == ' ')) {
++                return false;
++            }
++            if (++sampled >= 20) {
++                break;
++            }
++        }
++        return sampled > 0;
++    }
++
++    static String normalize(String header) {
++        StringBuilder out = new StringBuilder();
++        for (char ch : header.toCharArray()) {
++            if (Character.isLetterOrDigit(ch)) {
++                out.append(Character.toLowerCase(ch));
++            }
++        }
++        return out.toString();
++    }
++
++    private static Map<String, String> identityAliases() {
++        Map<String, String> aliases = new HashMap<>();
++        put(aliases, "name", "name", "player", "playername");
++        put(aliases, "unique_id", "uid", "uniqueid", "fmuid", "playerid");
++        put(aliases, "age", "age");
++        put(aliases, "nationality", "nationality", "nation", "nationalities", "country");
++        put(aliases, "club", "club", "team", "currentclub");
++        put(aliases, "playing_club", "playingclub", "onloanat", "loanclub");
++        put(aliases, "position", "position", "positions", "positionsselected", "pos1");
++        put(aliases, "height_cm", "height");
++        put(aliases, "salary_weekly_raw", "wage", "salary", "wages", "weeklywage");
++        put(aliases, "asking_price", "transfervalue", "value", "askingprice", "transferfee");
++        put(aliases, "contract_end_date", "expires", "contractexpires", "contractend", "contractenddate", "expiry");
++        put(aliases, "date_of_birth", "dob", "dateofbirth", "born", "birthdate");
++        put(aliases, "joined_club_date", "joined", "joinedclub", "signed");
++        put(aliases, "ca", "ca", "currentability");
++        put(aliases, "pa", "pa", "potentialability");
++        put(aliases, "gender", "gender", "sex");
++        put(aliases, "current_reputation", "reputation", "currentreputation");
++        put(aliases, "home_reputation", "homereputation");
++        put(aliases, "world_reputation", "worldreputation");
++        put(aliases, "transfer_listed", "transferstatus", "transferlisted");
++        put(aliases, "listed_for_loan", "loanstatus", "loanlisted", "listedforloan");
++        put(aliases, "injured", "injured");
++        put(aliases, "injury", "injury", "injurystatus");
++        return Map.copyOf(aliases);
++    }
++
++    private static Map<String, String> attributeAliases() {
++        Map<String, String> aliases = new HashMap<>();
++        Stream.concat(
++                        AttributeDefinitions.VISIBLE_FIELDS.stream(),
++                        AttributeDefinitions.HIDDEN_DIRECT_FIELDS.stream())
++                .map(FieldDef::name)
++                .forEach(name -> aliases.put(normalize(name), name));
++
++        put(aliases, "Corners", "cor");
++        put(aliases, "Crossing", "cro");
++        put(aliases, "Dribbling", "dri");
++        put(aliases, "Finishing", "fin");
++        put(aliases, "FirstTouch", "fir", "firsttouch");
++        put(aliases, "FreeKicks", "fre", "freekicktaking", "freekicks");
++        put(aliases, "Heading", "hea");
++        put(aliases, "LongShots", "lon", "longshots");
++        put(aliases, "LongThrows", "lth", "longthrows");
++        put(aliases, "Marking", "mar");
++        put(aliases, "Passing", "pas");
++        put(aliases, "Penalties", "pen", "penaltytaking");
++        put(aliases, "Tackling", "tck");
++        put(aliases, "Technique", "tec");
++        put(aliases, "Aggression", "agg");
++        put(aliases, "Anticipation", "ant");
++        put(aliases, "Bravery", "bra");
++        put(aliases, "Composure", "cmp");
++        put(aliases, "Concentration", "cnt");
++        put(aliases, "Decisions", "dec");
++        put(aliases, "Determination", "det");
++        put(aliases, "Flair", "fla");
++        put(aliases, "Leadership", "ldr");
++        put(aliases, "OffTheBall", "otb", "offtheball");
++        put(aliases, "Positioning", "pos");
++        put(aliases, "Teamwork", "tea");
++        put(aliases, "Vision", "vis");
++        put(aliases, "WorkRate", "wor", "workrate");
++        put(aliases, "Acceleration", "acc");
++        put(aliases, "Agility", "agi");
++        put(aliases, "Balance", "bal");
++        put(aliases, "JumpingReach", "jum", "jumpingreach", "jumping");
++        put(aliases, "NaturalFitness", "naturalfitness");
++        put(aliases, "Pace", "pac");
++        put(aliases, "Stamina", "sta");
++        put(aliases, "Strength", "str");
++        put(aliases, "AerialAbility", "aer", "aerialreach", "aerialability");
++        put(aliases, "CommandOfArea", "cmd", "commandofarea");
++        put(aliases, "Communication", "com");
++        put(aliases, "Eccentricity", "ecc");
++        put(aliases, "Handling", "han");
++        put(aliases, "Kicking", "kic");
++        put(aliases, "OneOnOnes", "1v1", "oneonones");
++        put(aliases, "TendencyToPunch", "pun", "punchingtendency", "tendencytopunch");
++        put(aliases, "Reflexes", "ref");
++        put(aliases, "RushingOut", "tro", "rushingouttendency", "rushingout");
++        put(aliases, "Throwing", "thr");
++        put(aliases, "LeftFoot", "lfoot", "leftfoot", "lft");
++        put(aliases, "RightFoot", "rfoot", "rightfoot", "rft");
++        put(aliases, "Versatility", "ver", "versatility");
++        put(aliases, "Consistency", "con", "consistency");
++        put(aliases, "ImportantMatches", "imp", "importantmatches");
++        put(aliases, "InjuryProneness", "inj", "injuryproneness");
++        put(aliases, "Dirtiness", "dirtiness");
++        return Map.copyOf(aliases);
++    }
++
++    private static Map<String, String> staffIdentityAliases() {
++        Map<String, String> aliases = new HashMap<>();
++        put(aliases, "name", "name", "staff", "staffname");
++        put(aliases, "unique_id", "uid", "uniqueid", "fmuid", "staffid");
++        put(aliases, "age", "age");
++        put(aliases, "nationality", "nationality", "nat", "nation", "country");
++        put(aliases, "club", "club", "team", "currentclub", "employer");
++        put(aliases, "division", "division", "league", "competition");
++        put(aliases, "job", "job", "role", "position", "jobtitle");
++        put(aliases, "date_of_birth", "dob", "dateofbirth", "born", "birthdate");
++        put(aliases, "salary_weekly_raw", "wage", "salary", "wages", "weeklywage");
++        put(aliases, "contract_end_date", "expires", "contractexpires", "contractend", "contractenddate", "expiry");
++        put(aliases, "gender", "gender", "sex");
++        put(aliases, "ca", "ca", "currentability");
++        put(aliases, "pa", "pa", "potentialability");
++        put(aliases, "current_reputation", "reputation", "currentreputation");
++        put(aliases, "home_reputation", "homereputation");
++        put(aliases, "world_reputation", "worldreputation");
++        return Map.copyOf(aliases);
++    }
++
++    private static Map<String, String> staffAttributeAliases() {
++        Map<String, String> aliases = new HashMap<>();
++        for (StaffAttributeDefinitions.StaffAttribute attribute : StaffAttributeDefinitions.ALL) {
++            aliases.put(normalize(attribute.key()), attribute.key());
++            aliases.put(normalize(attribute.label()), attribute.key());
++        }
++        put(aliases, "people_management", "manmanagement", "manmanagment", "peoplemanagement");
++        put(aliases, "working_with_youngsters", "wwy", "youngsters", "workingwithyoungsters");
++        put(aliases, "judging_player_ability", "jpa", "judgingability");
++        put(aliases, "judging_player_potential", "jpp", "judgingpotential");
++        put(aliases, "judging_staff_ability", "jsa");
++        put(aliases, "tactical_knowledge", "tacknowledge", "tacticalknowledge");
++        put(aliases, "sports_science", "sportsscience", "sportscience");
++        put(aliases, "data_analysis", "dataanalysis", "analytics");
++        put(aliases, "set_pieces", "setpieces", "setpiece");
++        put(aliases, "physiotherapy", "physio", "physiotherapy");
++        put(aliases, "determination", "det");
++        put(aliases, "motivating", "mot", "motivation");
++        put(aliases, "negotiating", "neg", "negotiation");
++        put(aliases, "goalkeeping", "gkcoaching", "goalkeepingcoaching");
++        put(aliases, "possession", "poss");
++        return Map.copyOf(aliases);
++    }
++
++    public enum Kind { PLAYER, STAFF }
++
++    private static void put(Map<String, String> aliases, String value, String... keys) {
++        for (String key : keys) {
++            aliases.put(key, value);
++        }
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/csv/CsvPositions.java b/src/main/java/com/github/fmaiassistent/csv/CsvPositions.java
+new file mode 100644
+index 0000000..291d464
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/csv/CsvPositions.java
+@@ -0,0 +1,94 @@
++package com.github.fmaiassistent.csv;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++
++/**
++ * Expands an FM position string such as "D/WB (R), DM" into the fourteen positional
++ * ratings the snapshot schema stores.
++ *
++ * <p>A view export states only which positions a player can play, never how naturally,
++ * so every listed position is written as {@link #LISTED} and everything else as
++ * {@link #UNLISTED}. Ratings sourced this way are therefore coarser than the RAM
++ * exporter's, which reads the real 1-20 familiarity.
++ */
++public final class CsvPositions {
++    public static final int LISTED = 20;
++    public static final int UNLISTED = 1;
++
++    private static final Map<String, List<String>> SIDED_ROLES = Map.of(
++            "D", List.of("DefenderLeft", "DefenderCentral", "DefenderRight"),
++            "WB", List.of("WingBackLeft", "", "WingBackRight"),
++            "M", List.of("MidfielderLeft", "MidfielderCentral", "MidfielderRight"),
++            "AM", List.of("AttackingMidfielderLeft", "AttackingMidfielderCentral", "AttackingMidfielderRight"));
++    private static final Map<String, String> UNSIDED_ROLES = Map.of(
++            "GK", "Goalkeeper",
++            "DM", "DefensiveMidfielder",
++            "ST", "Striker",
++            "S", "Striker",
++            "F", "Striker");
++
++    private CsvPositions() {
++    }
++
++    public static Map<String, Integer> parse(String raw) {
++        Map<String, Integer> ratings = new LinkedHashMap<>();
++        allFields().forEach(field -> ratings.put(field, UNLISTED));
++        if (CsvValues.isUnknown(raw)) {
++            return ratings;
++        }
++        for (String segment : raw.split(",")) {
++            applySegment(segment.trim(), ratings);
++        }
++        return ratings;
++    }
++
++    public static List<String> allFields() {
++        return List.of(
++                "Goalkeeper", "DefenderLeft", "DefenderCentral", "DefenderRight",
++                "WingBackLeft", "DefensiveMidfielder", "WingBackRight",
++                "MidfielderLeft", "MidfielderCentral", "MidfielderRight",
++                "AttackingMidfielderLeft", "AttackingMidfielderCentral", "AttackingMidfielderRight",
++                "Striker");
++    }
++
++    private static void applySegment(String segment, Map<String, Integer> ratings) {
++        if (segment.isBlank()) {
++            return;
++        }
++        int parenthesis = segment.indexOf('(');
++        String rolePart = (parenthesis < 0 ? segment : segment.substring(0, parenthesis)).trim();
++        String sidePart = parenthesis < 0
++                ? ""
++                : segment.substring(parenthesis + 1).replace(")", "").trim().toUpperCase(Locale.ROOT);
++        for (String role : rolePart.split("/")) {
++            applyRole(role.trim().toUpperCase(Locale.ROOT), sidePart, ratings);
++        }
++    }
++
++    private static void applyRole(String role, String sides, Map<String, Integer> ratings) {
++        String unsided = UNSIDED_ROLES.get(role);
++        if (unsided != null) {
++            ratings.put(unsided, LISTED);
++            return;
++        }
++        List<String> sided = SIDED_ROLES.get(role);
++        if (sided == null) {
++            return;
++        }
++        String applicable = sides.isBlank() ? "C" : sides;
++        for (char side : applicable.toCharArray()) {
++            int index = switch (side) {
++                case 'L' -> 0;
++                case 'C' -> 1;
++                case 'R' -> 2;
++                default -> -1;
++            };
++            if (index >= 0 && !sided.get(index).isBlank()) {
++                ratings.put(sided.get(index), LISTED);
++            }
++        }
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/csv/CsvSnapshotLoader.java b/src/main/java/com/github/fmaiassistent/csv/CsvSnapshotLoader.java
+new file mode 100644
+index 0000000..3d580e4
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/csv/CsvSnapshotLoader.java
+@@ -0,0 +1,352 @@
++package com.github.fmaiassistent.csv;
++
++import com.github.fmaiassistent.exporter.ClubExporter;
++import com.github.fmaiassistent.exporter.PlayerExporter;
++import com.github.fmaiassistent.exporter.StaffExporter;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++import java.time.LocalDate;
++import java.time.Period;
++import java.time.format.DateTimeParseException;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.Set;
++
++/**
++ * Turns exported FM views into the same shape the RAM exporters produce, so a CSV
++ * snapshot can be persisted and queried by exactly the same code path.
++ *
++ * <p>Rows are correlated by synthetic addresses. {@code SnapshotDatabaseWriter} only ever
++ * uses those values as join handles between people and clubs, never as real pointers, so
++ * a stable hash of the club name serves the same purpose as the RAM address did. Players
++ * and staff are loaded together because they share one synthesised club table.
++ */
++public final class CsvSnapshotLoader {
++    private static final long CLUB_ADDRESS_SEED = 0x51C5_0000_0000L;
++    private static final long PLAYER_ADDRESS_SEED = 0x91A7_0000_0000L;
++    private static final long STAFF_ADDRESS_SEED = 0x57AF_0000_0000L;
++    private static final List<String> PLAYER_HIGH_VALUE_COLUMNS = List.of(
++            "unique_id", "position", "age", "club", "ca", "pa", "asking_price",
++            "salary_weekly_raw", "contract_end_date", "nationality");
++    private static final List<String> STAFF_HIGH_VALUE_COLUMNS = List.of(
++            "unique_id", "job", "age", "club", "ca", "pa", "salary_weekly_raw",
++            "contract_end_date", "nationality");
++
++    public CsvSnapshot load(Path playersCsv, Path staffCsv, String gameDate) throws IOException {
++        return load(
++                playersCsv == null ? null : CsvTable.read(playersCsv),
++                staffCsv == null ? null : CsvTable.read(staffCsv),
++                gameDate);
++    }
++
++    public CsvSnapshot load(CsvTable players, String gameDate) {
++        return load(players, null, gameDate);
++    }
++
++    public CsvSnapshot load(CsvTable players, CsvTable staff, String gameDate) {
++        if (players == null && staff == null) {
++            throw new IllegalArgumentException("Loading a CSV snapshot needs a players or a staff export");
++        }
++        LocalDate asOf = parseDate(gameDate);
++        Set<String> clubNames = new LinkedHashSet<>();
++        PeopleTable playerRows = players == null
++                ? PeopleTable.empty()
++                : readPlayers(players, asOf, clubNames);
++        PeopleTable staffRows = staff == null
++                ? PeopleTable.empty()
++                : readStaff(staff, asOf, clubNames);
++
++        List<Map<String, Object>> clubs = new ArrayList<>(clubNames.size());
++        for (String club : clubNames) {
++            Map<String, Object> row = new LinkedHashMap<>();
++            row.put("sourceAddress", clubAddress(club));
++            row.put("name", club);
++            row.put("gender", "");
++            row.put("competition", "");
++            row.put("nation", "");
++            row.put("reputation", 0);
++            clubs.add(row);
++        }
++
++        String safeGameDate = gameDate == null ? "" : gameDate;
++        return new CsvSnapshot(
++                new PlayerExporter.ExportResult(safeGameDate, playerRows.rows()),
++                new StaffExporter.ExportResult(safeGameDate, staffRows.rows()),
++                new ClubExporter.ExportResult(List.copyOf(clubs)),
++                playerRows.diagnostics(),
++                staffRows.diagnostics());
++    }
++
++    private PeopleTable readPlayers(CsvTable table, LocalDate asOf, Set<String> clubNames) {
++        CsvColumnMapping mapping = CsvColumnMapping.of(table, CsvColumnMapping.Kind.PLAYER);
++        List<Map<String, Object>> rows = new ArrayList<>(table.rows().size());
++        int estimated = 0;
++        int index = 0;
++
++        for (Map<String, String> source : table.rows()) {
++            String name = value(source, mapping, "name").orElse("");
++            if (name.isBlank()) {
++                continue;
++            }
++            Map<String, Object> row = new LinkedHashMap<>();
++            String club = value(source, mapping, "club").orElse("");
++            String playingClub = value(source, mapping, "playing_club").orElse(club);
++            collectClubs(clubNames, club, playingClub);
++
++            row.put("index", String.valueOf(index));
++            row.put("record", String.valueOf(PLAYER_ADDRESS_SEED + index));
++            row.put("name", name);
++            row.put("club", club);
++            row.put("playing_club", playingClub);
++            row.put("loan_club", club.equals(playingClub) ? "" : playingClub);
++            row.put("is_loaned_out", club.equals(playingClub) ? "" : "Yes");
++            row.put("_club_address", clubAddress(club));
++            row.put("_playing_club_address", clubAddress(playingClub.isBlank() ? club : playingClub));
++
++            putUniqueId(row, source, mapping);
++            putText(row, source, mapping, "nationality", "gender", "injury");
++            value(source, mapping, "height_cm").flatMap(CsvValues::heightCm)
++                    .ifPresent(height -> row.put("height_cm", height));
++            putInteger(row, source, mapping, "ca", "pa",
++                    "current_reputation", "home_reputation", "world_reputation");
++
++            value(source, mapping, "salary_weekly_raw").flatMap(CsvValues::money).ifPresent(weekly -> {
++                row.put("salary_weekly_raw", weekly.intValue());
++                row.put("salary_pa", (int) Math.min(Integer.MAX_VALUE, weekly * 52));
++            });
++            value(source, mapping, "asking_price").flatMap(CsvValues::money).ifPresent(price -> {
++                row.put("asking_price", price);
++                row.put("asking_price_raw", price);
++            });
++
++            putDate(row, source, mapping, "contract_end_date", "joined_club_date");
++            Optional<String> dateOfBirth = value(source, mapping, "date_of_birth").flatMap(CsvValues::date);
++            dateOfBirth.ifPresent(date -> row.put("date_of_birth", date));
++            age(value(source, mapping, "age"), dateOfBirth, asOf)
++                    .ifPresent(age -> {
++                        row.put("age", String.valueOf(age));
++                        if (asOf != null) {
++                            row.put("age_as_of", asOf.toString());
++                        }
++                    });
++
++            putFlag(row, source, mapping, "transfer_listed", "listed_for_loan", "injured");
++            CsvPositions.parse(value(source, mapping, "position").orElse("")).forEach(row::put);
++
++            if (putAttributes(row, source, mapping)) {
++                estimated++;
++            }
++            rows.add(row);
++            index++;
++        }
++        return new PeopleTable(List.copyOf(rows), diagnostics(table, mapping, rows.size(), estimated,
++                PLAYER_HIGH_VALUE_COLUMNS));
++    }
++
++    private PeopleTable readStaff(CsvTable table, LocalDate asOf, Set<String> clubNames) {
++        CsvColumnMapping mapping = CsvColumnMapping.of(table, CsvColumnMapping.Kind.STAFF);
++        List<Map<String, Object>> rows = new ArrayList<>(table.rows().size());
++        int estimated = 0;
++        int index = 0;
++
++        for (Map<String, String> source : table.rows()) {
++            String name = value(source, mapping, "name").orElse("");
++            if (name.isBlank()) {
++                continue;
++            }
++            Map<String, Object> row = new LinkedHashMap<>();
++            String club = value(source, mapping, "club").orElse("");
++            collectClubs(clubNames, club);
++
++            row.put("staff_index", index);
++            row.put("record_address", "0x" + Long.toHexString(STAFF_ADDRESS_SEED + index));
++            row.put("name", name);
++            row.put("club", club);
++            row.put("_club_address", clubAddress(club));
++
++            putUniqueId(row, source, mapping);
++            putText(row, source, mapping, "nationality", "gender", "division", "job");
++            putInteger(row, source, mapping, "ca", "pa",
++                    "current_reputation", "home_reputation", "world_reputation");
++            value(source, mapping, "salary_weekly_raw").flatMap(CsvValues::money)
++                    .ifPresent(weekly -> row.put("salary_weekly_raw", weekly));
++            putDate(row, source, mapping, "contract_end_date");
++            Optional<String> dateOfBirth = value(source, mapping, "date_of_birth").flatMap(CsvValues::date);
++            dateOfBirth.ifPresent(date -> row.put("date_of_birth", date));
++            age(value(source, mapping, "age"), dateOfBirth, asOf)
++                    .ifPresent(age -> {
++                        row.put("age", age);
++                        if (asOf != null) {
++                            row.put("age_as_of", asOf.toString());
++                        }
++                    });
++
++            if (putAttributes(row, source, mapping)) {
++                estimated++;
++            }
++            rows.add(row);
++            index++;
++        }
++        return new PeopleTable(List.copyOf(rows), diagnostics(table, mapping, rows.size(), estimated,
++                STAFF_HIGH_VALUE_COLUMNS));
++    }
++
++    private static boolean putAttributes(
++            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping) {
++        boolean estimated = false;
++        for (Map.Entry<String, String> attribute : mapping.attributeFieldsByHeader().entrySet()) {
++            String raw = source.get(attribute.getKey());
++            estimated |= CsvValues.isRange(raw);
++            CsvValues.attribute(raw).ifPresent(rating -> row.put(attribute.getValue(), rating));
++        }
++        return estimated;
++    }
++
++    private static void putUniqueId(
++            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping) {
++        value(source, mapping, "unique_id").flatMap(CsvValues::integer)
++                .ifPresent(uid -> row.put("unique_id", uid.longValue()));
++    }
++
++    private static void putText(
++            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
++        for (String target : targets) {
++            value(source, mapping, target).ifPresent(text -> row.put(target, text));
++        }
++    }
++
++    private static void putInteger(
++            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
++        for (String target : targets) {
++            value(source, mapping, target).flatMap(CsvValues::integer)
++                    .ifPresent(number -> row.put(target, number));
++        }
++    }
++
++    private static void putDate(
++            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
++        for (String target : targets) {
++            value(source, mapping, target).flatMap(CsvValues::date).ifPresent(date -> row.put(target, date));
++        }
++    }
++
++    private static void putFlag(
++            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
++        for (String target : targets) {
++            value(source, mapping, target).flatMap(CsvValues::flag).ifPresent(flag -> row.put(target, flag));
++        }
++    }
++
++    private static Optional<Integer> age(
++            Optional<String> rawAge, Optional<String> dateOfBirth, LocalDate asOf) {
++        Optional<Integer> stated = rawAge.flatMap(CsvValues::integer);
++        if (stated.isPresent()) {
++            return stated;
++        }
++        if (dateOfBirth.isPresent() && asOf != null) {
++            return Optional.of(Period.between(LocalDate.parse(dateOfBirth.get()), asOf).getYears());
++        }
++        return Optional.empty();
++    }
++
++    private static void collectClubs(Set<String> clubNames, String... clubs) {
++        for (String club : clubs) {
++            if (club != null && !club.isBlank()) {
++                clubNames.add(club);
++            }
++        }
++    }
++
++    private static Diagnostics diagnostics(
++            CsvTable table, CsvColumnMapping mapping, int loaded, int estimated, List<String> highValueColumns) {
++        List<String> missing = new ArrayList<>();
++        for (String target : highValueColumns) {
++            if (!mapping.has(target)) {
++                missing.add(target);
++            }
++        }
++        return new Diagnostics(
++                table.rows().size(),
++                loaded,
++                estimated,
++                mapping.attributeFieldsByHeader().size(),
++                mapping.mappedTargets(),
++                mapping.unmappedHeaders(),
++                missing);
++    }
++
++    private static Optional<String> value(
++            Map<String, String> row, CsvColumnMapping mapping, String target) {
++        return mapping.header(target)
++                .map(row::get)
++                .filter(value -> !CsvValues.isUnknown(value))
++                .map(String::trim);
++    }
++
++    private static LocalDate parseDate(String gameDate) {
++        if (gameDate == null || gameDate.isBlank()) {
++            return null;
++        }
++        try {
++            return LocalDate.parse(gameDate);
++        } catch (DateTimeParseException exception) {
++            throw new IllegalArgumentException("game_date must be an ISO date such as 2026-08-01");
++        }
++    }
++
++    private static long clubAddress(String club) {
++        if (club == null || club.isBlank()) {
++            return 0;
++        }
++        long hash = 0xcbf2_9ce4_8422_2325L;
++        for (byte b : club.toLowerCase().getBytes(StandardCharsets.UTF_8)) {
++            hash = (hash ^ (b & 0xff)) * 0x1000_0000_01b3L;
++        }
++        return CLUB_ADDRESS_SEED + Math.abs(hash % 0xFFFF_FFFFL);
++    }
++
++    private record PeopleTable(List<Map<String, Object>> rows, Diagnostics diagnostics) {
++        static PeopleTable empty() {
++            return new PeopleTable(List.of(), Diagnostics.empty());
++        }
++    }
++
++    public record CsvSnapshot(
++            PlayerExporter.ExportResult players,
++            StaffExporter.ExportResult staff,
++            ClubExporter.ExportResult clubs,
++            Diagnostics playerDiagnostics,
++            Diagnostics staffDiagnostics) {
++    }
++
++    public record Diagnostics(
++            int csvRows,
++            int loadedRows,
++            int estimatedRows,
++            int mappedAttributes,
++            List<String> mappedColumns,
++            List<String> ignoredColumns,
++            List<String> missingColumns) {
++        public static Diagnostics empty() {
++            return new Diagnostics(0, 0, 0, 0, List.of(), List.of(), List.of());
++        }
++
++        public Map<String, Object> toMap() {
++            Map<String, Object> out = new LinkedHashMap<>();
++            out.put("csv_rows", csvRows);
++            out.put("loaded", loadedRows);
++            out.put("rows_with_estimated_attributes", estimatedRows);
++            out.put("mapped_attributes", mappedAttributes);
++            out.put("mapped_columns", mappedColumns);
++            out.put("ignored_columns", ignoredColumns);
++            out.put("missing_columns", missingColumns);
++            return out;
++        }
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/csv/CsvTable.java b/src/main/java/com/github/fmaiassistent/csv/CsvTable.java
+new file mode 100644
+index 0000000..acd32d6
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/csv/CsvTable.java
+@@ -0,0 +1,133 @@
++package com.github.fmaiassistent.csv;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * RFC 4180 reader for the CSV that FM26 Player Export writes. The delimiter is sniffed
++ * from the header line because the plugin follows the host locale and emits semicolons
++ * wherever a comma would collide with a decimal separator.
++ */
++public final class CsvTable {
++    private static final char[] CANDIDATE_DELIMITERS = {',', ';', '\t', '|'};
++
++    private final List<String> headers;
++    private final List<Map<String, String>> rows;
++
++    private CsvTable(List<String> headers, List<Map<String, String>> rows) {
++        this.headers = List.copyOf(headers);
++        this.rows = List.copyOf(rows);
++    }
++
++    public static CsvTable read(Path file) throws IOException {
++        return parse(Files.readString(file, StandardCharsets.UTF_8));
++    }
++
++    public static CsvTable parse(String content) {
++        String text = content.startsWith("﻿") ? content.substring(1) : content;
++        if (text.isBlank()) {
++            throw new IllegalArgumentException("The CSV file is empty");
++        }
++        char delimiter = sniffDelimiter(text);
++        List<List<String>> records = split(text, delimiter);
++        if (records.isEmpty()) {
++            throw new IllegalArgumentException("The CSV file has no header row");
++        }
++        List<String> headers = records.getFirst();
++        List<Map<String, String>> rows = new ArrayList<>(records.size() - 1);
++        for (List<String> record : records.subList(1, records.size())) {
++            if (record.size() == 1 && record.getFirst().isBlank()) {
++                continue;
++            }
++            Map<String, String> row = new LinkedHashMap<>();
++            for (int column = 0; column < headers.size(); column++) {
++                row.put(headers.get(column), column < record.size() ? record.get(column) : "");
++            }
++            rows.add(row);
++        }
++        return new CsvTable(headers, rows);
++    }
++
++    public List<String> headers() {
++        return headers;
++    }
++
++    public List<Map<String, String>> rows() {
++        return rows;
++    }
++
++    private static char sniffDelimiter(String text) {
++        int lineEnd = text.indexOf('\n');
++        String header = lineEnd < 0 ? text : text.substring(0, lineEnd);
++        char best = ',';
++        int bestCount = 0;
++        for (char candidate : CANDIDATE_DELIMITERS) {
++            int count = countOutsideQuotes(header, candidate);
++            if (count > bestCount) {
++                best = candidate;
++                bestCount = count;
++            }
++        }
++        return best;
++    }
++
++    private static int countOutsideQuotes(String line, char delimiter) {
++        boolean quoted = false;
++        int count = 0;
++        for (char ch : line.toCharArray()) {
++            if (ch == '"') {
++                quoted = !quoted;
++            } else if (ch == delimiter && !quoted) {
++                count++;
++            }
++        }
++        return count;
++    }
++
++    private static List<List<String>> split(String text, char delimiter) {
++        List<List<String>> records = new ArrayList<>();
++        List<String> record = new ArrayList<>();
++        StringBuilder field = new StringBuilder();
++        boolean quoted = false;
++        for (int i = 0; i < text.length(); i++) {
++            char ch = text.charAt(i);
++            if (quoted) {
++                if (ch == '"') {
++                    if (i + 1 < text.length() && text.charAt(i + 1) == '"') {
++                        field.append('"');
++                        i++;
++                    } else {
++                        quoted = false;
++                    }
++                } else {
++                    field.append(ch);
++                }
++                continue;
++            }
++            if (ch == '"') {
++                quoted = true;
++            } else if (ch == delimiter) {
++                record.add(field.toString().trim());
++                field.setLength(0);
++            } else if (ch == '\n') {
++                record.add(field.toString().trim());
++                field.setLength(0);
++                records.add(record);
++                record = new ArrayList<>();
++            } else if (ch != '\r') {
++                field.append(ch);
++            }
++        }
++        if (!field.isEmpty() || !record.isEmpty()) {
++            record.add(field.toString().trim());
++            records.add(record);
++        }
++        return records;
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/csv/CsvValues.java b/src/main/java/com/github/fmaiassistent/csv/CsvValues.java
+new file mode 100644
+index 0000000..6d9207b
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/csv/CsvValues.java
+@@ -0,0 +1,253 @@
++package com.github.fmaiassistent.csv;
++
++import java.time.LocalDate;
++import java.time.format.DateTimeFormatter;
++import java.time.format.DateTimeParseException;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Optional;
++
++/**
++ * Parses the display strings FM writes into a view export. Everything here returns an
++ * empty Optional rather than a default, so an unreadable cell stays unknown instead of
++ * silently becoming a real-looking value.
++ */
++public final class CsvValues {
++    private static final List<String> UNKNOWN = List.of("", "-", "--", "n/a", "na", "unknown", "?");
++    private static final Map<String, Integer> FOOT_RATINGS = Map.of(
++            "very weak", 1,
++            "weak", 5,
++            "reasonable", 10,
++            "fairly strong", 13,
++            "strong", 16,
++            "very strong", 19);
++    private static final List<DateTimeFormatter> DATE_FORMATS = List.of(
++            DateTimeFormatter.ofPattern("d MMMM yyyy", Locale.ENGLISH),
++            DateTimeFormatter.ofPattern("d MMM yyyy", Locale.ENGLISH),
++            DateTimeFormatter.ofPattern("MMMM d yyyy", Locale.ENGLISH),
++            DateTimeFormatter.ofPattern("MMM d yyyy", Locale.ENGLISH));
++
++    private CsvValues() {
++    }
++
++    public static boolean isUnknown(String raw) {
++        return raw == null || UNKNOWN.contains(raw.trim().toLowerCase(Locale.ROOT));
++    }
++
++    /**
++     * Reads an attribute cell. FM renders unscouted players as a range ("12-15"); the
++     * midpoint is used and the caller is expected to treat such a row as an estimate.
++     */
++    public static Optional<Integer> attribute(String raw) {
++        if (isUnknown(raw)) {
++            return Optional.empty();
++        }
++        String text = raw.trim();
++        Integer foot = FOOT_RATINGS.get(text.toLowerCase(Locale.ROOT));
++        if (foot != null) {
++            return Optional.of(foot);
++        }
++        int dash = text.indexOf('-', 1);
++        if (dash > 0) {
++            Optional<Integer> low = integer(text.substring(0, dash));
++            Optional<Integer> high = integer(text.substring(dash + 1));
++            if (low.isPresent() && high.isPresent()) {
++                return Optional.of(clamp((low.get() + high.get()) / 2));
++            }
++        }
++        return integer(text).map(CsvValues::clamp);
++    }
++
++    public static boolean isRange(String raw) {
++        return raw != null && raw.trim().indexOf('-', 1) > 0 && attribute(raw).isPresent();
++    }
++
++    public static Optional<Integer> integer(String raw) {
++        if (isUnknown(raw)) {
++            return Optional.empty();
++        }
++        StringBuilder digits = new StringBuilder();
++        for (char ch : raw.trim().toCharArray()) {
++            if (Character.isDigit(ch) || (ch == '-' && digits.isEmpty())) {
++                digits.append(ch);
++            } else if (!digits.isEmpty()) {
++                break;
++            }
++        }
++        try {
++            return digits.isEmpty() || "-".contentEquals(digits)
++                    ? Optional.empty()
++                    : Optional.of(Integer.parseInt(digits.toString()));
++        } catch (NumberFormatException exception) {
++            return Optional.empty();
++        }
++    }
++
++    /**
++     * Reads a money cell such as "£14K p/w", "€2.5M" or "£11.5M - £14M". Ranges collapse
++     * to their midpoint. "Free" is zero; anything unpriced stays unknown.
++     */
++    public static Optional<Long> money(String raw) {
++        if (isUnknown(raw)) {
++            return Optional.empty();
++        }
++        String text = raw.trim().toLowerCase(Locale.ROOT);
++        if (text.startsWith("free")) {
++            return Optional.of(0L);
++        }
++        if (text.contains("not for sale") || text.contains("unavailable") || text.contains("on loan")) {
++            return Optional.empty();
++        }
++        int separator = rangeSeparator(text);
++        if (separator > 0) {
++            Optional<Long> low = singleMoney(text.substring(0, separator));
++            Optional<Long> high = singleMoney(text.substring(separator + 1));
++            if (low.isPresent() && high.isPresent()) {
++                return Optional.of((low.get() + high.get()) / 2);
++            }
++        }
++        return singleMoney(text);
++    }
++
++    public static Optional<Integer> heightCm(String raw) {
++        if (isUnknown(raw)) {
++            return Optional.empty();
++        }
++        String text = raw.trim().toLowerCase(Locale.ROOT);
++        int feetMark = text.indexOf('\'');
++        if (feetMark > 0) {
++            Optional<Integer> feet = integer(text.substring(0, feetMark));
++            Optional<Integer> inches = integer(text.substring(feetMark + 1));
++            if (feet.isPresent()) {
++                return Optional.of((int) Math.round((feet.get() * 12 + inches.orElse(0)) * 2.54));
++            }
++        }
++        Optional<Integer> value = integer(text);
++        if (value.isEmpty()) {
++            return Optional.empty();
++        }
++        if (text.contains("m") && !text.contains("cm") && value.get() < 10) {
++            return decimal(text).map(metres -> (int) Math.round(metres * 100));
++        }
++        return value;
++    }
++
++    /**
++     * Normalises a date cell to the ISO form the RAM exporter writes. Ambiguous numeric
++     * dates are read day-first, matching FM's English (UK) default.
++     */
++    public static Optional<String> date(String raw) {
++        if (isUnknown(raw)) {
++            return Optional.empty();
++        }
++        String text = raw.trim().replace(',', ' ').replaceAll("\\s+", " ");
++        try {
++            return Optional.of(LocalDate.parse(text).toString());
++        } catch (DateTimeParseException ignored) {
++            // Not ISO; fall through to the display formats below.
++        }
++        String[] parts = text.split("[/.\\-]");
++        if (parts.length == 3) {
++            Optional<Integer> first = integer(parts[0]);
++            Optional<Integer> second = integer(parts[1]);
++            Optional<Integer> year = integer(parts[2]);
++            if (first.isPresent() && second.isPresent() && year.isPresent()) {
++                boolean monthFirst = first.get() <= 12 && second.get() > 12;
++                int day = monthFirst ? second.get() : first.get();
++                int month = monthFirst ? first.get() : second.get();
++                try {
++                    return Optional.of(LocalDate.of(fullYear(year.get()), month, day).toString());
++                } catch (RuntimeException exception) {
++                    return Optional.empty();
++                }
++            }
++        }
++        for (DateTimeFormatter format : DATE_FORMATS) {
++            try {
++                return Optional.of(LocalDate.parse(text, format).toString());
++            } catch (DateTimeParseException ignored) {
++                // Try the next display format.
++            }
++        }
++        return Optional.empty();
++    }
++
++    public static Optional<Boolean> flag(String raw) {
++        if (isUnknown(raw)) {
++            return Optional.empty();
++        }
++        String text = raw.trim().toLowerCase(Locale.ROOT);
++        if (List.of("yes", "y", "true", "1").contains(text)) {
++            return Optional.of(true);
++        }
++        if (List.of("no", "n", "false", "0").contains(text)) {
++            return Optional.of(false);
++        }
++        return Optional.of(true);
++    }
++
++    private static Optional<Long> singleMoney(String text) {
++        Optional<Double> amount = decimal(text);
++        if (amount.isEmpty()) {
++            return Optional.empty();
++        }
++        double multiplier = 1;
++        String tail = text.substring(text.lastIndexOf(lastDigit(text)) + 1).trim();
++        if (tail.startsWith("k")) {
++            multiplier = 1_000;
++        } else if (tail.startsWith("m")) {
++            multiplier = 1_000_000;
++        } else if (tail.startsWith("b")) {
++            multiplier = 1_000_000_000;
++        }
++        return Optional.of(Math.round(amount.get() * multiplier));
++    }
++
++    private static char lastDigit(String text) {
++        for (int i = text.length() - 1; i >= 0; i--) {
++            if (Character.isDigit(text.charAt(i))) {
++                return text.charAt(i);
++            }
++        }
++        return ' ';
++    }
++
++    private static Optional<Double> decimal(String text) {
++        StringBuilder number = new StringBuilder();
++        for (char ch : text.toCharArray()) {
++            if (Character.isDigit(ch) || (ch == '.' && !number.isEmpty())) {
++                number.append(ch);
++            } else if (ch == ',' ) {
++                continue;
++            } else if (!number.isEmpty()) {
++                break;
++            }
++        }
++        try {
++            return number.isEmpty() ? Optional.empty() : Optional.of(Double.parseDouble(number.toString()));
++        } catch (NumberFormatException exception) {
++            return Optional.empty();
++        }
++    }
++
++    private static int rangeSeparator(String text) {
++        for (int i = 1; i < text.length() - 1; i++) {
++            if (text.charAt(i) == '-' && text.charAt(i - 1) == ' ') {
++                return i;
++            }
++        }
++        return -1;
++    }
++
++    private static int fullYear(int year) {
++        if (year >= 100) {
++            return year;
++        }
++        return year < 50 ? 2000 + year : 1900 + year;
++    }
++
++    private static int clamp(int value) {
++        return Math.max(1, Math.min(20, value));
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/mcp/FmAiAssistentTools.java b/src/main/java/com/github/fmaiassistent/mcp/FmAiAssistentTools.java
+index 388bb60..0d63767 100644
+--- a/src/main/java/com/github/fmaiassistent/mcp/FmAiAssistentTools.java
++++ b/src/main/java/com/github/fmaiassistent/mcp/FmAiAssistentTools.java
+@@ -1317,6 +1317,12 @@ public class FmAiAssistentTools {
+     }
+ 
+     private static boolean inRange(Integer value, Integer min, Integer max) {
++        // An absent bound is not a constraint, so an unknown value still matches. Snapshots
++        // loaded from a CSV export leave ca, pa and reputation null, and an unfiltered search
++        // must still return those players. Matches the semantics used by the database services.
++        if (min == null && max == null) {
++            return true;
++        }
+         return value != null && (min == null || value >= min) && (max == null || value <= max);
+     }
+ 
+diff --git a/src/main/java/com/github/fmaiassistent/mcp/FmCsvTools.java b/src/main/java/com/github/fmaiassistent/mcp/FmCsvTools.java
+new file mode 100644
+index 0000000..0c5a049
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/mcp/FmCsvTools.java
+@@ -0,0 +1,41 @@
++package com.github.fmaiassistent.mcp;
++
++import com.github.fmaiassistent.service.CsvLoadAllService;
++import org.springframework.ai.tool.annotation.Tool;
++import org.springframework.ai.tool.annotation.ToolParam;
++import org.springframework.stereotype.Service;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.Map;
++
++@Service
++public class FmCsvTools {
++    private final CsvLoadAllService csvLoader;
++
++    public FmCsvTools(CsvLoadAllService csvLoader) {
++        this.csvLoader = csvLoader;
++    }
++
++    @Tool(name = "fm26_load_csv", description = """
++            Replace the local snapshot from CSV views exported out of FM26, for example by the FM26 Player \
++            Export plugin. Use this instead of fm26_refresh_data on macOS, or whenever FM's memory cannot be \
++            read. Pass a players export, a staff export, or both. A load replaces the entire snapshot, so \
++            loading only one of them clears the other: send both paths in one call to keep both. The result \
++            reports which columns were mapped, ignored and missing per file: read missing_columns before \
++            trusting any tool that depends on them, and treat rows counted in \
++            rows_with_estimated_attributes as scouting estimates rather than exact values.""")
++    public Map<String, Object> loadCsv(
++            @ToolParam(required = false, description = "Absolute path to the exported players CSV") String path,
++            @ToolParam(required = false, description = "Absolute path to the exported staff CSV") String staffPath,
++            @ToolParam(required = false, description = "In-game date of the export as an ISO date, for example 2026-08-01. Needed to derive ages when the view has no Age column.") String gameDate,
++            @ToolParam(required = false, description = "Name of the club the user manages, exactly as it appears in the CSV") String managedClub)
++            throws IOException {
++        return csvLoader.loadCsv(
++                        path == null || path.isBlank() ? null : Path.of(path),
++                        staffPath == null || staffPath.isBlank() ? null : Path.of(staffPath),
++                        gameDate,
++                        managedClub)
++                .toMap();
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/service/CsvLoadAllService.java b/src/main/java/com/github/fmaiassistent/service/CsvLoadAllService.java
+new file mode 100644
+index 0000000..bd760c1
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/service/CsvLoadAllService.java
+@@ -0,0 +1,191 @@
++package com.github.fmaiassistent.service;
++
++import com.github.fmaiassistent.config.JCacheConfiguration;
++import com.github.fmaiassistent.csv.CsvSnapshotLoader;
++import com.github.fmaiassistent.csv.CsvTable;
++import com.github.fmaiassistent.domain.entity.LoadMetadataEntity;
++import com.github.fmaiassistent.managedclub.ManagedClubContextService;
++import com.github.fmaiassistent.repository.DatabaseService;
++import com.github.fmaiassistent.repository.LoadMetadataRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.cache.annotation.CacheEvict;
++import org.springframework.cache.annotation.Caching;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.time.OffsetDateTime;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++
++/**
++ * Replaces the snapshot from a CSV exported out of FM instead of from the running
++ * process. Persistence is deliberately the same {@link SnapshotDatabaseWriter} path the
++ * RAM load uses, so every query, MCP tool and UI view behaves identically afterwards.
++ */
++@Service
++public class CsvLoadAllService {
++    private static final Logger log = LoggerFactory.getLogger(CsvLoadAllService.class);
++
++    private final DatabaseService databaseService;
++    private final SnapshotDatabaseWriter snapshotWriter;
++    private final ManagedClubContextService managedClubContexts;
++    private final LoadMetadataRepository metadata;
++    private final CsvSnapshotLoader loader = new CsvSnapshotLoader();
++
++    public CsvLoadAllService(
++            DatabaseService databaseService,
++            SnapshotDatabaseWriter snapshotWriter,
++            ManagedClubContextService managedClubContexts,
++            LoadMetadataRepository metadata) {
++        this.databaseService = databaseService;
++        this.snapshotWriter = snapshotWriter;
++        this.managedClubContexts = managedClubContexts;
++        this.metadata = metadata;
++    }
++
++    @Caching(evict = {
++            @CacheEvict(cacheNames = JCacheConfiguration.PLAYERS_CACHE, allEntries = true),
++            @CacheEvict(cacheNames = JCacheConfiguration.PLAYERS_WITH_CLUBS_CACHE, allEntries = true),
++            @CacheEvict(cacheNames = JCacheConfiguration.STAFF_WITH_CLUBS_CACHE, allEntries = true),
++            @CacheEvict(cacheNames = JCacheConfiguration.NATIONS_CACHE, allEntries = true),
++            @CacheEvict(cacheNames = JCacheConfiguration.COMPETITIONS_CACHE, allEntries = true),
++            @CacheEvict(cacheNames = JCacheConfiguration.CLUB_NAMES_CACHE, allEntries = true),
++            @CacheEvict(cacheNames = JCacheConfiguration.CLUB_CACHE, allEntries = true),
++            @CacheEvict(cacheNames = JCacheConfiguration.PLAYER_MAPPING_CACHE, allEntries = true)
++    })
++    public CsvLoadResult loadCsv(Path playersCsv, Path staffCsv, String gameDate, String managedClub)
++            throws IOException {
++        if (playersCsv == null && staffCsv == null) {
++            throw new IllegalArgumentException("Pass a players CSV, a staff CSV, or both");
++        }
++        requireFile(playersCsv, "players");
++        requireFile(staffCsv, "staff");
++        return loadTables(
++                playersCsv == null ? null : CsvTable.read(playersCsv),
++                staffCsv == null ? null : CsvTable.read(staffCsv),
++                sourceFiles(playersCsv, staffCsv),
++                gameDate,
++                managedClub);
++    }
++
++    /**
++     * Loads already-parsed tables, for callers such as the UI that hold uploaded bytes
++     * rather than a file on disk.
++     */
++    public CsvLoadResult loadUploads(
++            String playersCsv, String staffCsv, String sourceLabel, String gameDate, String managedClub) {
++        if (blank(playersCsv) && blank(staffCsv)) {
++            throw new IllegalArgumentException("Pass a players CSV, a staff CSV, or both");
++        }
++        return loadTables(
++                blank(playersCsv) ? null : CsvTable.parse(playersCsv),
++                blank(staffCsv) ? null : CsvTable.parse(staffCsv),
++                sourceLabel,
++                gameDate,
++                managedClub);
++    }
++
++    @Transactional(rollbackFor = Exception.class)
++    public CsvLoadResult loadTables(
++            CsvTable playersCsv, CsvTable staffCsv, String sourceLabel, String gameDate, String managedClub) {
++        long started = System.nanoTime();
++        CsvSnapshotLoader.CsvSnapshot snapshot = loader.load(playersCsv, staffCsv, gameDate);
++        if (snapshot.players().rows().isEmpty() && snapshot.staff().rows().isEmpty()) {
++            throw new IllegalArgumentException("The CSV contained no named people");
++        }
++
++        // A load replaces the whole snapshot, so a players-only load clears any staff that
++        // an earlier load wrote, and the other way round. Pass both files to keep both.
++        databaseService.clearAllTables();
++        Map<Long, Long> clubIds = snapshotWriter.saveClubs(snapshot.clubs(), Map.of());
++        snapshotWriter.savePlayers(snapshot.players(), clubIds);
++        snapshotWriter.saveStaff(snapshot.staff(), clubIds);
++
++        String snapshotId = UUID.randomUUID().toString();
++        String loadedAt = OffsetDateTime.now().toString();
++        List<LoadMetadataEntity> snapshotMetadata = new ArrayList<>(List.of(
++                new LoadMetadataEntity("snapshot_id", snapshotId),
++                new LoadMetadataEntity("source", "csv"),
++                new LoadMetadataEntity("source_file", sourceLabel == null ? "" : sourceLabel),
++                new LoadMetadataEntity("players_count", String.valueOf(snapshot.players().rows().size())),
++                new LoadMetadataEntity("staff_count", String.valueOf(snapshot.staff().rows().size())),
++                new LoadMetadataEntity("clubs_count", String.valueOf(snapshot.clubs().rows().size())),
++                new LoadMetadataEntity("competitions_count", "0"),
++                new LoadMetadataEntity("game_date", gameDate == null ? "" : gameDate),
++                new LoadMetadataEntity("loaded_at", loadedAt),
++                new LoadMetadataEntity("clubs_loaded_at", loadedAt)));
++        metadata.saveAll(snapshotMetadata);
++
++        if (managedClub == null || managedClub.isBlank()) {
++            managedClubContexts.markUnavailable(
++                    "A CSV snapshot has no managed club. Pass managed_club when loading to enable squad tools.");
++        } else {
++            managedClubContexts.markUnavailable(
++                    "Managed club reported as " + managedClub + " by the CSV load");
++        }
++
++        log.info("FM26 CSV snapshot loaded in {} ms: {} players, {} staff, {} clubs",
++                (System.nanoTime() - started) / 1_000_000,
++                snapshot.players().rows().size(),
++                snapshot.staff().rows().size(),
++                snapshot.clubs().rows().size());
++        return new CsvLoadResult(
++                snapshotId,
++                gameDate,
++                snapshot.players().rows().size(),
++                snapshot.staff().rows().size(),
++                snapshot.clubs().rows().size(),
++                snapshot.playerDiagnostics(),
++                snapshot.staffDiagnostics());
++    }
++
++    private static boolean blank(String value) {
++        return value == null || value.isBlank();
++    }
++
++    private static void requireFile(Path csv, String kind) {
++        if (csv != null && !Files.isRegularFile(csv)) {
++            throw new IllegalArgumentException("No " + kind + " CSV file at " + csv);
++        }
++    }
++
++    private static String sourceFiles(Path playersCsv, Path staffCsv) {
++        StringBuilder out = new StringBuilder();
++        if (playersCsv != null) {
++            out.append(playersCsv);
++        }
++        if (staffCsv != null) {
++            out.append(out.isEmpty() ? "" : "; ").append(staffCsv);
++        }
++        return out.toString();
++    }
++
++    public record CsvLoadResult(
++            String snapshotId,
++            String gameDate,
++            int players,
++            int staff,
++            int clubs,
++            CsvSnapshotLoader.Diagnostics playerDiagnostics,
++            CsvSnapshotLoader.Diagnostics staffDiagnostics) {
++        public Map<String, Object> toMap() {
++            Map<String, Object> out = new LinkedHashMap<>();
++            out.put("snapshot_id", snapshotId);
++            out.put("game_date", gameDate);
++            out.put("source", "csv");
++            out.put("players", players);
++            out.put("staff", staff);
++            out.put("clubs", clubs);
++            out.put("players_detail", playerDiagnostics.toMap());
++            out.put("staff_detail", staffDiagnostics.toMap());
++            return out;
++        }
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/web/ui/CsvLoadDialog.java b/src/main/java/com/github/fmaiassistent/web/ui/CsvLoadDialog.java
+new file mode 100644
+index 0000000..ab8de3f
+--- /dev/null
++++ b/src/main/java/com/github/fmaiassistent/web/ui/CsvLoadDialog.java
+@@ -0,0 +1,189 @@
++package com.github.fmaiassistent.web.ui;
++
++import com.github.fmaiassistent.service.CsvLoadAllService;
++import com.vaadin.flow.component.UI;
++import com.vaadin.flow.component.button.Button;
++import com.vaadin.flow.component.button.ButtonVariant;
++import com.vaadin.flow.component.dialog.Dialog;
++import com.vaadin.flow.component.html.Span;
++import com.vaadin.flow.component.notification.Notification;
++import com.vaadin.flow.component.orderedlayout.VerticalLayout;
++import com.vaadin.flow.component.textfield.TextField;
++import com.vaadin.flow.component.upload.Upload;
++import com.vaadin.flow.component.icon.VaadinIcon;
++import com.vaadin.flow.server.streams.UploadHandler;
++
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.Consumer;
++
++/**
++ * Loads a snapshot from FM view exports, for setups where FM's memory cannot be read.
++ * Both files are optional individually, but a load replaces the whole snapshot, so the
++ * dialog says plainly that sending only one of them clears the other.
++ */
++class CsvLoadDialog extends Dialog {
++    private static final int MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
++
++    private final CsvLoadAllService csvLoad;
++    private final Consumer<CsvLoadAllService.CsvLoadResult> loaded;
++    private final AtomicReference<UploadedCsv> players = new AtomicReference<>(UploadedCsv.empty());
++    private final AtomicReference<UploadedCsv> staff = new AtomicReference<>(UploadedCsv.empty());
++    private final TextField gameDate = new TextField("In-game date");
++    private final TextField managedClub = new TextField("Club you manage");
++    private final Span summary = new Span();
++    private final Button load = new Button("Load snapshot", VaadinIcon.DATABASE.create());
++
++    CsvLoadDialog(CsvLoadAllService csvLoad, Consumer<CsvLoadAllService.CsvLoadResult> loaded) {
++        this.csvLoad = csvLoad;
++        this.loaded = loaded;
++        setHeaderTitle("Load data from FM exports");
++        addClassName("csv-load-dialog");
++        setWidth("34rem");
++
++        Span help = new Span(
++                "Export a players view and a staff view from FM to CSV, then upload them here. "
++                        + "A load replaces the whole snapshot, so upload both files together to keep both. "
++                        + "Attributes shown as a range for unscouted players are stored as their midpoint.");
++        help.addClassName("csv-load-help");
++
++        gameDate.setPlaceholder("2026-08-01");
++        gameDate.setHelperText("ISO date. Only needed when the view has no Age column.");
++        gameDate.setWidthFull();
++        managedClub.setPlaceholder("Aston Villa");
++        managedClub.setHelperText("Optional. Squad tools need a club name to work against.");
++        managedClub.setWidthFull();
++        summary.addClassName("csv-load-summary");
++
++        VerticalLayout body = new VerticalLayout(
++                help,
++                upload("Players export (.csv)", "or drop your players CSV here", players),
++                upload("Staff export (.csv)", "or drop your staff CSV here", staff),
++                gameDate,
++                managedClub,
++                summary);
++        body.setPadding(false);
++        body.setSpacing(true);
++        add(body);
++
++        load.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
++        load.setEnabled(false);
++        load.addClickListener(ignored -> runLoad());
++        Button cancel = new Button("Close", ignored -> close());
++        cancel.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
++        getFooter().add(cancel, load);
++    }
++
++    private Upload upload(String label, String dropLabel, AtomicReference<UploadedCsv> target) {
++        Upload upload = new Upload(UploadHandler.inMemory((metadata, bytes) -> {
++            if (bytes.length > MAX_UPLOAD_BYTES) {
++                throw new IllegalArgumentException("CSV upload is larger than 64 MB");
++            }
++            target.set(new UploadedCsv(
++                    metadata.fileName() == null ? "upload.csv" : metadata.fileName(),
++                    new String(bytes, StandardCharsets.UTF_8)));
++        }));
++        Button chooser = new Button(label, VaadinIcon.UPLOAD.create());
++        upload.setUploadButton(chooser);
++        upload.setDropLabel(new Span(dropLabel));
++        upload.setAcceptedFileTypes(".csv", "text/csv");
++        upload.setMaxFileSize(MAX_UPLOAD_BYTES);
++        upload.setMaxFiles(1);
++        upload.setWidthFull();
++        upload.addAllFinishedListener(ignored -> getUI().ifPresent(ui -> ui.access(this::refreshReadiness)));
++        upload.addFileRemovedListener(ignored -> {
++            target.set(UploadedCsv.empty());
++            refreshReadiness();
++        });
++        upload.addFileRejectedListener(event -> Notification.show(event.getErrorMessage()));
++        return upload;
++    }
++
++    private void refreshReadiness() {
++        List<String> chosen = new ArrayList<>();
++        if (players.get().present()) {
++            chosen.add("players: " + players.get().name());
++        }
++        if (staff.get().present()) {
++            chosen.add("staff: " + staff.get().name());
++        }
++        summary.setText(chosen.isEmpty() ? "" : String.join("  |  ", chosen));
++        load.setEnabled(!chosen.isEmpty());
++    }
++
++    private void runLoad() {
++        UI ui = UI.getCurrent();
++        UploadedCsv playerFile = players.get();
++        UploadedCsv staffFile = staff.get();
++        String label = sources(playerFile, staffFile);
++        load.setEnabled(false);
++        load.setText("Loading...");
++
++        Thread.ofVirtual().name("csv-snapshot-load").start(() -> {
++            try {
++                CsvLoadAllService.CsvLoadResult result = csvLoad.loadUploads(
++                        playerFile.content(),
++                        staffFile.content(),
++                        label,
++                        emptyToNull(gameDate.getValue()),
++                        emptyToNull(managedClub.getValue()));
++                ui.access(() -> {
++                    loaded.accept(result);
++                    Notification.show(describe(result), 6000, Notification.Position.TOP_CENTER);
++                    close();
++                });
++            } catch (RuntimeException exception) {
++                ui.access(() -> {
++                    load.setEnabled(true);
++                    load.setText("Load snapshot");
++                    Notification.show(
++                            "CSV load failed: " + exception.getMessage(), 8000, Notification.Position.TOP_CENTER);
++                });
++            }
++        });
++    }
++
++    private static String describe(CsvLoadAllService.CsvLoadResult result) {
++        StringBuilder text = new StringBuilder("Loaded " + result.players() + " players and "
++                + result.staff() + " staff from CSV");
++        List<String> missing = new ArrayList<>(result.playerDiagnostics().missingColumns());
++        result.staffDiagnostics().missingColumns().stream()
++                .filter(column -> !missing.contains(column))
++                .forEach(missing::add);
++        if (!missing.isEmpty()) {
++            text.append(". Columns not in the export: ").append(String.join(", ", missing));
++        }
++        int estimated = result.playerDiagnostics().estimatedRows() + result.staffDiagnostics().estimatedRows();
++        if (estimated > 0) {
++            text.append(". ").append(estimated).append(" rows hold scouting estimates");
++        }
++        return text.toString();
++    }
++
++    private static String sources(UploadedCsv players, UploadedCsv staff) {
++        List<String> names = new ArrayList<>();
++        if (players.present()) {
++            names.add(players.name());
++        }
++        if (staff.present()) {
++            names.add(staff.name());
++        }
++        return String.join("; ", names);
++    }
++
++    private static String emptyToNull(String value) {
++        return value == null || value.isBlank() ? null : value.trim();
++    }
++
++    private record UploadedCsv(String name, String content) {
++        static UploadedCsv empty() {
++            return new UploadedCsv("", null);
++        }
++
++        boolean present() {
++            return content != null && !content.isBlank();
++        }
++    }
++}
+diff --git a/src/main/java/com/github/fmaiassistent/web/ui/MainView.java b/src/main/java/com/github/fmaiassistent/web/ui/MainView.java
+index 31c9f77..7d9d40e 100644
+--- a/src/main/java/com/github/fmaiassistent/web/ui/MainView.java
++++ b/src/main/java/com/github/fmaiassistent/web/ui/MainView.java
+@@ -84,6 +84,7 @@ public class MainView extends VerticalLayout {
+             "BALANCE", "TRANSFER_BUDGET", "PAYROLL_BUDGET");
+ 
+     private final DatabaseLoadAllService loadAll;
++    private final CsvLoadAllService csvLoad;
+     private final PlayerDatabaseService players;
+     private final StaffDatabaseService staff;
+     private final ClubDatabaseService clubs;
+@@ -94,6 +95,7 @@ public class MainView extends VerticalLayout {
+     private final Dialog loadingDialog = new Dialog();
+     private final ProgressBar spinner = new ProgressBar();
+     private final Button loadButton = new Button("Load data", VaadinIcon.DATABASE.create());
++    private final Button csvButton = new Button("Load CSV", VaadinIcon.FILE_TEXT_O.create());
+     private final Button freshnessButton = new Button(VaadinIcon.CLOCK.create());
+     private final Button settingsButton = new Button(VaadinIcon.COG.create());
+     private final Button filterButton = new Button("Filter", VaadinIcon.FILTER.create());
+@@ -119,6 +121,7 @@ public class MainView extends VerticalLayout {
+ 
+     public MainView(
+             DatabaseLoadAllService loadAll,
++            CsvLoadAllService csvLoad,
+             PlayerDatabaseService players,
+             StaffDatabaseService staff,
+             ClubDatabaseService clubs,
+@@ -131,6 +134,7 @@ public class MainView extends VerticalLayout {
+             TacticContextService tacticContexts,
+             ManagedClubContextService managedClubContexts) {
+         this.loadAll = loadAll;
++        this.csvLoad = csvLoad;
+         this.players = players;
+         this.staff = staff;
+         this.clubs = clubs;
+@@ -164,11 +168,15 @@ public class MainView extends VerticalLayout {
+ 
+     private Component header() {
+         loadButton.addClickListener(event -> loadAllData());
++        csvButton.addClickListener(event -> new CsvLoadDialog(csvLoad, this::afterCsvLoad).open());
+         freshnessButton.addClickListener(event -> checkSnapshotFreshness());
+         settingsButton.addClickListener(event -> openSettingsDialog());
+         filterButton.addClickListener(event -> openFilterDialog());
+         loadButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+         loadButton.addClassName("load-button");
++        csvButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY_INLINE);
++        csvButton.addClassName("csv-button");
++        csvButton.setTooltipText("Load a snapshot from FM view exports instead of RAM");
+         freshnessButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY_INLINE);
+         freshnessButton.setTooltipText("Check whether the loaded FM26 data is current");
+         freshnessButton.getElement().setAttribute("aria-label", "Check data freshness");
+@@ -192,7 +200,8 @@ public class MainView extends VerticalLayout {
+         brand.setSpacing(false);
+         brand.addClassName("brand");
+ 
+-        HorizontalLayout actions = new HorizontalLayout(status, freshnessButton, loadButton, settingsButton);
++        HorizontalLayout actions = new HorizontalLayout(
++                status, freshnessButton, csvButton, loadButton, settingsButton);
+         actions.setAlignItems(Alignment.CENTER);
+         actions.setSpacing(false);
+         actions.addClassName("app-actions");
+@@ -309,6 +318,18 @@ public class MainView extends VerticalLayout {
+                 }));
+     }
+ 
++    private void afterCsvLoad(CsvLoadAllService.CsvLoadResult result) {
++        status.setText("CSV snapshot"
++                + (result.gameDate() == null || result.gameDate().isBlank()
++                        ? "" : " | Game date " + result.gameDate())
++                + " | Players " + result.players()
++                + " | Staff " + result.staff()
++                + " | Clubs " + result.clubs()
++                + " | Competitions 0");
++        aiAssistant.refreshManagedClubContext();
++        refreshSelectedTab();
++    }
++
+     private void checkSnapshotFreshness() {
+         freshnessButton.setEnabled(false);
+         UI ui = UI.getCurrent();
+diff --git a/src/test/java/com/github/fmaiassistent/csv/CsvSnapshotLoaderTest.java b/src/test/java/com/github/fmaiassistent/csv/CsvSnapshotLoaderTest.java
+new file mode 100644
+index 0000000..d5af990
+--- /dev/null
++++ b/src/test/java/com/github/fmaiassistent/csv/CsvSnapshotLoaderTest.java
+@@ -0,0 +1,235 @@
++package com.github.fmaiassistent.csv;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.Map;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++class CsvSnapshotLoaderTest {
++    private final CsvSnapshotLoader loader = new CsvSnapshotLoader();
++
++    @Test
++    void mapsAbbreviatedFmColumnsOntoExporterFieldNames() {
++        var snapshot = loader.load(CsvTable.parse("""
++                Name,Age,Position,Club,Nationality,Wage,Transfer Value,Expires,Acc,Pac,Fin,OtB,Cmp,Ref
++                Ollie Watkins,30,ST (C),Aston Villa,ENG,£100K p/w,£40M,30/6/2028,15,16,16,15,14,3
++                """), "2026-08-01");
++
++        Map<String, Object> row = snapshot.players().rows().getFirst();
++        assertThat(row.get("name")).isEqualTo("Ollie Watkins");
++        assertThat(row.get("age")).isEqualTo("30");
++        assertThat(row.get("club")).isEqualTo("Aston Villa");
++        assertThat(row.get("Acceleration")).isEqualTo(15);
++        assertThat(row.get("Pace")).isEqualTo(16);
++        assertThat(row.get("Finishing")).isEqualTo(16);
++        assertThat(row.get("OffTheBall")).isEqualTo(15);
++        assertThat(row.get("Composure")).isEqualTo(14);
++        assertThat(row.get("Reflexes")).isEqualTo(3);
++        assertThat(row.get("Striker")).isEqualTo(CsvPositions.LISTED);
++        assertThat(row.get("Goalkeeper")).isEqualTo(CsvPositions.UNLISTED);
++        assertThat(row.get("salary_weekly_raw")).isEqualTo(100_000);
++        assertThat(row.get("salary_pa")).isEqualTo(5_200_000);
++        assertThat(row.get("asking_price")).isEqualTo(40_000_000L);
++        assertThat(row.get("contract_end_date")).isEqualTo("2028-06-30");
++    }
++
++    @Test
++    void expandsCompoundPositionStringsAcrossEverySide() {
++        var ratings = CsvPositions.parse("D/WB (RL), DM, M (C)");
++
++        assertThat(ratings.get("DefenderRight")).isEqualTo(CsvPositions.LISTED);
++        assertThat(ratings.get("DefenderLeft")).isEqualTo(CsvPositions.LISTED);
++        assertThat(ratings.get("DefenderCentral")).isEqualTo(CsvPositions.UNLISTED);
++        assertThat(ratings.get("WingBackRight")).isEqualTo(CsvPositions.LISTED);
++        assertThat(ratings.get("WingBackLeft")).isEqualTo(CsvPositions.LISTED);
++        assertThat(ratings.get("DefensiveMidfielder")).isEqualTo(CsvPositions.LISTED);
++        assertThat(ratings.get("MidfielderCentral")).isEqualTo(CsvPositions.LISTED);
++        assertThat(ratings.get("MidfielderRight")).isEqualTo(CsvPositions.UNLISTED);
++    }
++
++    @Test
++    void readsNatAsNaturalFitnessOnlyWhenItHoldsRatings() {
++        var ratingColumn = loader.load(CsvTable.parse("""
++                Name,Nationality,Nat
++                Boubacar Kamara,FRA,14
++                """), null);
++        assertThat(ratingColumn.players().rows().getFirst())
++                .containsEntry("NaturalFitness", 14)
++                .containsEntry("nationality", "FRA");
++
++        var nationColumn = loader.load(CsvTable.parse("""
++                Name,Nat
++                Boubacar Kamara,FRA
++                """), null);
++        assertThat(nationColumn.players().rows().getFirst())
++                .containsEntry("nationality", "FRA")
++                .doesNotContainKey("NaturalFitness");
++    }
++
++    @Test
++    void treatsScoutedRangesAsMidpointsAndCountsThemAsEstimates() {
++        var snapshot = loader.load(CsvTable.parse("""
++                Name,Fin,Pac
++                Known Player,15,16
++                Unscouted Player,10-14,8-12
++                """), null);
++
++        assertThat(snapshot.players().rows().getFirst()).containsEntry("Finishing", 15);
++        assertThat(snapshot.players().rows().get(1)).containsEntry("Finishing", 12).containsEntry("Pace", 10);
++        assertThat(snapshot.playerDiagnostics().estimatedRows()).isEqualTo(1);
++    }
++
++    @Test
++    void leavesUnpricedAndUnknownCellsUnknownRatherThanZero() {
++        var snapshot = loader.load(CsvTable.parse("""
++                Name,Transfer Value,Wage,Fin
++                Not For Sale Player,Not for Sale,-,N/A
++                Free Agent,Free,£0,12
++                """), null);
++
++        assertThat(snapshot.players().rows().getFirst())
++                .doesNotContainKey("asking_price")
++                .doesNotContainKey("salary_weekly_raw")
++                .doesNotContainKey("Finishing");
++        assertThat(snapshot.players().rows().get(1)).containsEntry("asking_price", 0L);
++    }
++
++    @Test
++    void linksPlayersToSynthesisedClubsByStableAddress() {
++        var snapshot = loader.load(CsvTable.parse("""
++                Name,Club
++                Player One,Aston Villa
++                Player Two,Aston Villa
++                Player Three,Leeds United
++                """), null);
++
++        assertThat(snapshot.clubs().rows()).hasSize(2);
++        Object villaAddress = snapshot.clubs().rows().getFirst().get("sourceAddress");
++        assertThat(snapshot.players().rows().getFirst().get("_club_address")).isEqualTo(villaAddress);
++        assertThat(snapshot.players().rows().get(1).get("_club_address")).isEqualTo(villaAddress);
++        assertThat(snapshot.players().rows().get(2).get("_club_address")).isNotEqualTo(villaAddress);
++    }
++
++    @Test
++    void derivesAgeFromDateOfBirthWhenTheViewHasNoAgeColumn() {
++        var snapshot = loader.load(CsvTable.parse("""
++                Name,DoB
++                Jacob Ramsey,28/5/2001
++                """), "2026-08-01");
++
++        assertThat(snapshot.players().rows().getFirst())
++                .containsEntry("date_of_birth", "2001-05-28")
++                .containsEntry("age", "25");
++    }
++
++    @Test
++    void reportsMappedIgnoredAndMissingColumns() {
++        var snapshot = loader.load(CsvTable.parse("""
++                Name,Club,Fin,Inf,Rec
++                Player One,Aston Villa,15,,
++                """), null);
++
++        assertThat(snapshot.playerDiagnostics().mappedColumns()).contains("name", "club");
++        assertThat(snapshot.playerDiagnostics().ignoredColumns()).contains("Inf", "Rec");
++        assertThat(snapshot.playerDiagnostics().missingColumns()).contains("unique_id", "ca", "pa", "position");
++        assertThat(snapshot.playerDiagnostics().mappedAttributes()).isEqualTo(1);
++    }
++
++    @Test
++    void parsesQuotedFieldsAndSemicolonDelimitedExports() {
++        var snapshot = loader.load(CsvTable.parse("""
++                Name;Club;Position
++                "Alexander-Arnold, Trent";Real Madrid;D (R)
++                """), null);
++
++        assertThat(snapshot.players().rows().getFirst())
++                .containsEntry("name", "Alexander-Arnold, Trent")
++                .containsEntry("club", "Real Madrid")
++                .containsEntry("DefenderRight", CsvPositions.LISTED);
++    }
++
++    @Test
++    void rejectsCsvWithoutANameColumn() {
++        assertThatThrownBy(() -> loader.load(CsvTable.parse("Club,Age\nAston Villa,30\n"), null))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("no player name column");
++    }
++
++    @Test
++    void mapsStaffCoachingAttributesFromLabelsAndAbbreviations() {
++        var snapshot = loader.load(null, CsvTable.parse("""
++                Name,Age,Job,Club,Nationality,Wage,Expires,Attacking,Defending,Tactical,Working With Youngsters,JPA,JPP,Man Management,Determination,Sports Science
++                Unai Emery,54,Manager,Aston Villa,ESP,£180K p/w,30/6/2029,18,16,19,14,17,16,18,19,12
++                """), "2026-08-01");
++
++        Map<String, Object> row = snapshot.staff().rows().getFirst();
++        assertThat(row.get("name")).isEqualTo("Unai Emery");
++        assertThat(row.get("job")).isEqualTo("Manager");
++        assertThat(row.get("age")).isEqualTo(54);
++        assertThat(row.get("attacking")).isEqualTo(18);
++        assertThat(row.get("tactical")).isEqualTo(19);
++        assertThat(row.get("working_with_youngsters")).isEqualTo(14);
++        assertThat(row.get("judging_player_ability")).isEqualTo(17);
++        assertThat(row.get("judging_player_potential")).isEqualTo(16);
++        assertThat(row.get("people_management")).isEqualTo(18);
++        assertThat(row.get("sports_science")).isEqualTo(12);
++        assertThat(row.get("salary_weekly_raw")).isEqualTo(180_000L);
++        assertThat(row.get("contract_end_date")).isEqualTo("2029-06-30");
++        assertThat(snapshot.players().rows()).isEmpty();
++    }
++
++    @Test
++    void sharesOneClubTableBetweenPlayersAndStaff() {
++        var snapshot = loader.load(
++                CsvTable.parse("""
++                        Name,Club
++                        Ollie Watkins,Aston Villa
++                        """),
++                CsvTable.parse("""
++                        Name,Job,Club
++                        Unai Emery,Manager,Aston Villa
++                        Pep Guardiola,Manager,Manchester City
++                        """),
++                null);
++
++        assertThat(snapshot.clubs().rows()).hasSize(2);
++        Object villa = snapshot.clubs().rows().getFirst().get("sourceAddress");
++        assertThat(snapshot.players().rows().getFirst().get("_club_address")).isEqualTo(villa);
++        assertThat(snapshot.staff().rows().getFirst().get("_club_address")).isEqualTo(villa);
++        assertThat(snapshot.staff().rows().get(1).get("_club_address")).isNotEqualTo(villa);
++    }
++
++    @Test
++    void readsNatAsNationalityOnStaffExportsWhereNaturalFitnessDoesNotExist() {
++        var snapshot = loader.load(null, CsvTable.parse("""
++                Name,Nat,Job
++                Unai Emery,ESP,Manager
++                """), null);
++
++        assertThat(snapshot.staff().rows().getFirst()).containsEntry("nationality", "ESP");
++    }
++
++    @Test
++    void reportsStaffDiagnosticsSeparatelyFromPlayers() {
++        var snapshot = loader.load(
++                CsvTable.parse("Name,Club,Fin\nOllie Watkins,Aston Villa,16\n"),
++                CsvTable.parse("Name,Club,Attacking,Inf\nUnai Emery,Aston Villa,18,\n"),
++                null);
++
++        assertThat(snapshot.playerDiagnostics().loadedRows()).isEqualTo(1);
++        assertThat(snapshot.playerDiagnostics().mappedAttributes()).isEqualTo(1);
++        assertThat(snapshot.staffDiagnostics().loadedRows()).isEqualTo(1);
++        assertThat(snapshot.staffDiagnostics().mappedAttributes()).isEqualTo(1);
++        assertThat(snapshot.staffDiagnostics().ignoredColumns()).contains("Inf");
++        assertThat(snapshot.staffDiagnostics().missingColumns()).contains("job", "ca", "pa");
++    }
++
++    @Test
++    void rejectsALoadWithNeitherFile() {
++        assertThatThrownBy(() -> loader.load((CsvTable) null, null, null))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("players or a staff export");
++    }
++}
+diff --git a/src/test/java/com/github/fmaiassistent/mcp/McpProtocolCompatibilityTest.java b/src/test/java/com/github/fmaiassistent/mcp/McpProtocolCompatibilityTest.java
+index 8e09f10..5db3dbd 100644
+--- a/src/test/java/com/github/fmaiassistent/mcp/McpProtocolCompatibilityTest.java
++++ b/src/test/java/com/github/fmaiassistent/mcp/McpProtocolCompatibilityTest.java
+@@ -155,12 +155,13 @@ class McpProtocolCompatibilityTest {
+                     .findFirst()
+                     .orElse(tools.body());
+             JsonNode listedTools = mapper.readTree(data).path("result").path("tools");
+-            assertEquals(20, listedTools.size());
++            assertEquals(21, listedTools.size());
+             Set<String> names = listedTools.valueStream()
+                     .map(tool -> tool.path("name").asText())
+                     .collect(Collectors.toSet());
+             assertTrue(names.containsAll(Set.of(
+                     "fm26_find_clubs",
++                    "fm26_load_csv",
+                     "fm26_find_players",
+                     "fm26_get_club_context",
+                     "fm26_get_player_details",
