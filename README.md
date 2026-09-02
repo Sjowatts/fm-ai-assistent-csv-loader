@@ -75,4 +75,6 @@ Verified on macOS 15 (Apple Silicon, JDK 25) against hand-built exports, loaded 
 
 ## Licence
 
-The code here is mine and carries no restrictions. Note that fm-ai-assistent itself publishes no licence, so it is "all rights reserved" by default — this repo deliberately contains no upstream source, only additions and a patch.
+MIT, see [LICENSE](LICENSE). This covers the code in this repository only.
+
+fm-ai-assistent itself publishes no licence, which means all rights reserved by default. This repo therefore contains no upstream source — only additions and a patch that applies to a clone you make yourself.
