@@ -113,7 +113,8 @@ public final class CsvSnapshotLoader {
             putText(row, source, mapping, "nationality", "gender", "injury");
             value(source, mapping, "height_cm").flatMap(CsvValues::heightCm)
                     .ifPresent(height -> row.put("height_cm", height));
-            putInteger(row, source, mapping, "ca", "pa",
+            putAbility(row, source, mapping, "ca", "pa");
+            putInteger(row, source, mapping,
                     "current_reputation", "home_reputation", "world_reputation");
 
             value(source, mapping, "salary_weekly_raw").flatMap(CsvValues::money).ifPresent(weekly -> {
@@ -172,7 +173,8 @@ public final class CsvSnapshotLoader {
 
             putUniqueId(row, source, mapping);
             putText(row, source, mapping, "nationality", "gender", "division", "job");
-            putInteger(row, source, mapping, "ca", "pa",
+            putAbility(row, source, mapping, "ca", "pa");
+            putInteger(row, source, mapping,
                     "current_reputation", "home_reputation", "world_reputation");
             value(source, mapping, "salary_weekly_raw").flatMap(CsvValues::money)
                     .ifPresent(weekly -> row.put("salary_weekly_raw", weekly));
@@ -225,6 +227,20 @@ public final class CsvSnapshotLoader {
             Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
         for (String target : targets) {
             value(source, mapping, target).flatMap(CsvValues::integer)
+                    .ifPresent(number -> row.put(target, number));
+        }
+    }
+
+    /**
+     * Current and potential ability. FM stores potential as a negative code (-1 to -10) when a
+     * player's PA is a randomised range rather than a settled value; those are not ability
+     * scores, so they are left unknown rather than written through as negative numbers.
+     */
+    private static void putAbility(
+            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
+        for (String target : targets) {
+            value(source, mapping, target).flatMap(CsvValues::integer)
+                    .filter(number -> number > 0)
                     .ifPresent(number -> row.put(target, number));
         }
     }

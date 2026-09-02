@@ -55,7 +55,7 @@ Any view works as long as it has a Name column. `examples/` holds a players and 
 
 ## Limits
 
-`ca` and `pa` are not in any FM view, so tools ranking on raw ability fall back to attribute-derived scoring. Clubs are name-only stubs — no finances, facilities or competition. Competitions are not loaded at all. Managed-club detection needs memory, so squad tools want an explicit `managingClub`. Staff coaching stars need every weighted attribute present, which means a staff view carrying all 21 coaching attributes — `StaffRoleRatingCalculator` returns empty otherwise.
+`ca` and `pa` load when the view carries FM26's `CA`/`PA` columns; without them, tools ranking on raw ability fall back to attribute-derived scoring. A negative `PA` is FM's randomised-potential range code rather than a score, and is left unknown. Clubs are name-only stubs — no finances, facilities or competition. Competitions are not loaded at all. Managed-club detection needs memory, so squad tools want an explicit `managingClub`. Staff coaching stars need every weighted attribute present, which means a staff view carrying all 21 coaching attributes — `StaffRoleRatingCalculator` returns empty otherwise.
 
 ## Bug fix carried in the patch
 

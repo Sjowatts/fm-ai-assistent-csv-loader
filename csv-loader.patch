@@ -411,10 +411,10 @@ index 0000000..291d464
 +}
 diff --git a/src/main/java/com/github/fmaiassistent/csv/CsvSnapshotLoader.java b/src/main/java/com/github/fmaiassistent/csv/CsvSnapshotLoader.java
 new file mode 100644
-index 0000000..3d580e4
+index 0000000..ad4106c
 --- /dev/null
 +++ b/src/main/java/com/github/fmaiassistent/csv/CsvSnapshotLoader.java
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,368 @@
 +package com.github.fmaiassistent.csv;
 +
 +import com.github.fmaiassistent.exporter.ClubExporter;
@@ -530,7 +530,8 @@ index 0000000..3d580e4
 +            putText(row, source, mapping, "nationality", "gender", "injury");
 +            value(source, mapping, "height_cm").flatMap(CsvValues::heightCm)
 +                    .ifPresent(height -> row.put("height_cm", height));
-+            putInteger(row, source, mapping, "ca", "pa",
++            putAbility(row, source, mapping, "ca", "pa");
++            putInteger(row, source, mapping,
 +                    "current_reputation", "home_reputation", "world_reputation");
 +
 +            value(source, mapping, "salary_weekly_raw").flatMap(CsvValues::money).ifPresent(weekly -> {
@@ -589,7 +590,8 @@ index 0000000..3d580e4
 +
 +            putUniqueId(row, source, mapping);
 +            putText(row, source, mapping, "nationality", "gender", "division", "job");
-+            putInteger(row, source, mapping, "ca", "pa",
++            putAbility(row, source, mapping, "ca", "pa");
++            putInteger(row, source, mapping,
 +                    "current_reputation", "home_reputation", "world_reputation");
 +            value(source, mapping, "salary_weekly_raw").flatMap(CsvValues::money)
 +                    .ifPresent(weekly -> row.put("salary_weekly_raw", weekly));
@@ -642,6 +644,20 @@ index 0000000..3d580e4
 +            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
 +        for (String target : targets) {
 +            value(source, mapping, target).flatMap(CsvValues::integer)
++                    .ifPresent(number -> row.put(target, number));
++        }
++    }
++
++    /**
++     * Current and potential ability. FM stores potential as a negative code (-1 to -10) when a
++     * player's PA is a randomised range rather than a settled value; those are not ability
++     * scores, so they are left unknown rather than written through as negative numbers.
++     */
++    private static void putAbility(
++            Map<String, Object> row, Map<String, String> source, CsvColumnMapping mapping, String... targets) {
++        for (String target : targets) {
++            value(source, mapping, target).flatMap(CsvValues::integer)
++                    .filter(number -> number > 0)
 +                    .ifPresent(number -> row.put(target, number));
 +        }
 +    }
@@ -1704,10 +1720,10 @@ index 31c9f77..7d9d40e 100644
          UI ui = UI.getCurrent();
 diff --git a/src/test/java/com/github/fmaiassistent/csv/CsvSnapshotLoaderTest.java b/src/test/java/com/github/fmaiassistent/csv/CsvSnapshotLoaderTest.java
 new file mode 100644
-index 0000000..b851863
+index 0000000..4bb8051
 --- /dev/null
 +++ b/src/test/java/com/github/fmaiassistent/csv/CsvSnapshotLoaderTest.java
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,297 @@
 +package com.github.fmaiassistent.csv;
 +
 +import org.junit.jupiter.api.Test;
@@ -1980,6 +1996,29 @@ index 0000000..b851863
 +
 +        assertThat(snapshot.playerDiagnostics().ignoredColumns())
 +                .contains("Picked", "Inf", "Style");
++    }
++
++    @Test
++    void readsFm26AbilityColumnsAndTreatsRandomisedPotentialAsUnknown() {
++        // FM26 exposes current and potential ability as plain "CA"/"PA" columns.
++        var snapshot = loader.load(CsvTable.parse("""
++                Player;Age;Unique ID;CA;PA
++                Mads Kikkenborg;26;2000257061;120;127
++                Unsettled Wonderkid;17;2000257062;95;-8
++                """), null);
++
++        assertThat(snapshot.players().rows().getFirst())
++                .containsEntry("unique_id", 2000257061L)
++                .containsEntry("ca", 120)
++                .containsEntry("pa", 127);
++
++        // FM stores -1..-10 as a randomised potential RANGE, not a settled ability score,
++        // so it must not reach the snapshot as a negative number.
++        assertThat(snapshot.players().rows().get(1))
++                .containsEntry("ca", 95)
++                .doesNotContainKey("pa");
++
++        assertThat(snapshot.playerDiagnostics().missingColumns()).doesNotContain("ca", "pa");
 +    }
 +}
 diff --git a/src/test/java/com/github/fmaiassistent/mcp/McpProtocolCompatibilityTest.java b/src/test/java/com/github/fmaiassistent/mcp/McpProtocolCompatibilityTest.java

@@ -271,4 +271,27 @@ class CsvSnapshotLoaderTest {
         assertThat(snapshot.playerDiagnostics().ignoredColumns())
                 .contains("Picked", "Inf", "Style");
     }
+
+    @Test
+    void readsFm26AbilityColumnsAndTreatsRandomisedPotentialAsUnknown() {
+        // FM26 exposes current and potential ability as plain "CA"/"PA" columns.
+        var snapshot = loader.load(CsvTable.parse("""
+                Player;Age;Unique ID;CA;PA
+                Mads Kikkenborg;26;2000257061;120;127
+                Unsettled Wonderkid;17;2000257062;95;-8
+                """), null);
+
+        assertThat(snapshot.players().rows().getFirst())
+                .containsEntry("unique_id", 2000257061L)
+                .containsEntry("ca", 120)
+                .containsEntry("pa", 127);
+
+        // FM stores -1..-10 as a randomised potential RANGE, not a settled ability score,
+        // so it must not reach the snapshot as a negative number.
+        assertThat(snapshot.players().rows().get(1))
+                .containsEntry("ca", 95)
+                .doesNotContainKey("pa");
+
+        assertThat(snapshot.playerDiagnostics().missingColumns()).doesNotContain("ca", "pa");
+    }
 }
