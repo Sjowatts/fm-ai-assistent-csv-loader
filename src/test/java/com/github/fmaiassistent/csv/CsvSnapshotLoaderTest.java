@@ -232,4 +232,43 @@ class CsvSnapshotLoaderTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("players or a staff export");
     }
+
+    @Test
+    void mapsFm26FullNameHeadersFromTheMacosExportPlugin() {
+        // Real header shape emitted by the fm26-player-export-macos BepInEx plugin:
+        // semicolon-delimited, FM's full attribute names rather than abbreviations,
+        // a "Player" name column, and three view-metadata columns FM26 adds.
+        var snapshot = loader.load(CsvTable.parse("""
+                Picked;Inf;Player;Style;Age;Position;Marking;Technique;Tackling;Penalty Taking;Passing;Aerial Reach;Transfer Value;Long Throws;Long Shots;Heading;Free Kick Taking;First Touch;Finishing;Dribbling;Crossing;Corners;Strength;Stamina;Pace;Natural Fitness;Balance;Jumping Reach;Agility;Acceleration;Throwing;Rushing Out (Tendency);Reflexes;Punching;One On Ones;Kicking;Handling;Eccentricity;Communication;Command Of Area;Aggression;Anticipation;Bravery;Composure;Concentration;Decisions;Determination;Flair;Leadership;Off The Ball;Positioning;Team Work;Vision;Work Rate
+                GK;;Mads Kikkenborg;Assertive;26;GK;1;11;1;2;8;15;£700K - £1.5M;3;2;2;7;8;1;1;2;6;12;12;12;13;12;18;12;11;7;11;13;15;13;10;11;8;11;12;14;11;12;12;15;16;7;2;9;2;11;12;11;11
+                """), "2026-08-01");
+
+        Map<String, Object> row = snapshot.players().rows().getFirst();
+        assertThat(row.get("name")).isEqualTo("Mads Kikkenborg");
+        assertThat(row.get("age")).isEqualTo("26");
+        assertThat(row.get("Goalkeeper")).isEqualTo(CsvPositions.LISTED);
+
+        // Full FM labels whose text differs from the exporter's field name.
+        assertThat(row.get("AerialAbility")).isEqualTo(15);
+        assertThat(row.get("Penalties")).isEqualTo(2);
+        assertThat(row.get("FreeKicks")).isEqualTo(7);
+        assertThat(row.get("NaturalFitness")).isEqualTo(13);
+        assertThat(row.get("JumpingReach")).isEqualTo(18);
+        assertThat(row.get("RushingOut")).isEqualTo(11);
+        assertThat(row.get("OneOnOnes")).isEqualTo(13);
+        assertThat(row.get("CommandOfArea")).isEqualTo(12);
+        assertThat(row.get("OffTheBall")).isEqualTo(2);
+        assertThat(row.get("Teamwork")).isEqualTo(12);
+        assertThat(row.get("WorkRate")).isEqualTo(11);
+
+        // FM26 exports this one WITHOUT the "(Tendency)" suffix it keeps on Rushing Out,
+        // so "punching" needs its own alias onto TendencyToPunch.
+        assertThat(row.get("TendencyToPunch")).isEqualTo(15);
+
+        // "£700K - £1.5M" is a scouting range, stored as its midpoint.
+        assertThat(row.get("asking_price")).isEqualTo(1_100_000L);
+
+        assertThat(snapshot.playerDiagnostics().ignoredColumns())
+                .contains("Picked", "Inf", "Style");
+    }
 }

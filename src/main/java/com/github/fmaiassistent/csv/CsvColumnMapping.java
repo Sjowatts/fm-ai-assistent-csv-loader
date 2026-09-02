@@ -211,7 +211,7 @@ public final class CsvColumnMapping {
         put(aliases, "Handling", "han");
         put(aliases, "Kicking", "kic");
         put(aliases, "OneOnOnes", "1v1", "oneonones");
-        put(aliases, "TendencyToPunch", "pun", "punchingtendency", "tendencytopunch");
+        put(aliases, "TendencyToPunch", "pun", "punchingtendency", "tendencytopunch", "punching");
         put(aliases, "Reflexes", "ref");
         put(aliases, "RushingOut", "tro", "rushingouttendency", "rushingout");
         put(aliases, "Throwing", "thr");
